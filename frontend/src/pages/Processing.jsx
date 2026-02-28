@@ -20,6 +20,8 @@ const Processing = () => {
     // Live execution state
     const [activeJobId, setActiveJobId] = useState(null)
     const [jobStatus, setJobStatus] = useState(null)
+    const [migrationEvent, setMigrationEvent] = useState(null)
+    const prevTasks = useRef([])
 
     const pollInterval = useRef(null)
 
@@ -36,9 +38,30 @@ const Processing = () => {
         pollInterval.current = setInterval(async () => {
             try {
                 const res = await axios.get(`${API_BASE}/job_status/${jobId}`)
-                setJobStatus(res.data)
+                const newStatus = res.data
 
-                if (res.data.status === "COMPLETED" || res.data.status === "FAILED") {
+                // Detect Migration Events for Clarity
+                if (prevTasks.current.length > 0 && newStatus.tasks) {
+                    newStatus.tasks.forEach(task => {
+                        const oldTask = prevTasks.current.find(t => t.task_id === task.task_id)
+                        if (oldTask && oldTask.assigned_node && task.assigned_node && oldTask.assigned_node !== task.assigned_node) {
+                            // Migration detected!
+                            setMigrationEvent({
+                                partition: task.partition,
+                                from: oldTask.assigned_node,
+                                to: task.assigned_node,
+                                time: Date.now()
+                            })
+                            // Clear after 5 seconds
+                            setTimeout(() => setMigrationEvent(null), 5000)
+                        }
+                    })
+                }
+
+                prevTasks.current = newStatus.tasks || []
+                setJobStatus(newStatus)
+
+                if (newStatus.status === "COMPLETED" || newStatus.status === "FAILED") {
                     clearInterval(pollInterval.current)
                     setLoading(false)
                 }
@@ -52,6 +75,22 @@ const Processing = () => {
     }
 
     useEffect(() => {
+        // Recover active job on mount
+        const recoverJob = async () => {
+            try {
+                const res = await axios.get(`${API_BASE}/active_job`)
+                if (res.data.job_id) {
+                    setActiveJobId(res.data.job_id)
+                    startPolling(res.data.job_id)
+                    setLoading(true) // Set loading while recovery is happening
+                }
+            } catch (err) {
+                console.error("Recovery error:", err)
+            }
+        }
+
+        recoverJob()
+
         return () => {
             if (pollInterval.current) clearInterval(pollInterval.current)
         }
@@ -94,6 +133,17 @@ const Processing = () => {
             case 'COMPLETED': return 'text-emerald-400 bg-emerald-500/10 border-emerald-400/20'
             case 'FAILED': return 'text-rose-400 bg-rose-500/10 border-rose-500/20'
             default: return 'text-slate-500 bg-white/5 border-white/10'
+        }
+    }
+
+    const handleSimulateFailure = async (workerId, action) => {
+        try {
+            await axios.post(`${API_BASE}/simulate_failure`, {
+                node_id: workerId,
+                action: action
+            })
+        } catch (err) {
+            console.error("Simulation error:", err)
         }
     }
 
@@ -329,7 +379,34 @@ const Processing = () => {
                                 </div>
                             </motion.div>
 
-                            {/* Matrix Grid */}
+                            {/* Global Alerts for Migration */}
+                            <AnimatePresence>
+                                {migrationEvent && (
+                                    <motion.div
+                                        initial={{ opacity: 0, scale: 0.9, y: 50 }}
+                                        animate={{ opacity: 1, scale: 1, y: 0 }}
+                                        exit={{ opacity: 0, scale: 0.9, y: 100 }}
+                                        className="fixed bottom-12 left-1/2 -translate-x-1/2 z-[100] px-10 py-6 bg-rose-600/90 backdrop-blur-xl text-white rounded-[2.5rem] shadow-[0_30px_60px_-15px_rgba(225,29,72,0.6)] flex flex-col items-center gap-2 border border-rose-400/50"
+                                    >
+                                        <div className="flex items-center gap-4">
+                                            <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center animate-bounce">
+                                                <Zap className="w-6 h-6 fill-current" />
+                                            </div>
+                                            <div className="flex flex-col">
+                                                <span className="text-[10px] font-black uppercase tracking-[0.4em] opacity-80">Fault Resilience Active</span>
+                                                <span className="text-xl font-black tracking-tight">Migrating Partition #{migrationEvent.partition}</span>
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center gap-3 mt-2 px-4 py-2 bg-black/20 rounded-2xl w-full justify-center">
+                                            <span className="text-[9px] font-mono opacity-60 truncate max-w-[120px]">{migrationEvent.from}</span>
+                                            <ArrowRight className="w-3 h-3 text-rose-300" />
+                                            <span className="text-[9px] font-mono text-emerald-300 truncate max-w-[120px]">{migrationEvent.to}</span>
+                                        </div>
+                                    </motion.div>
+                                )}
+                            </AnimatePresence>
+
+                            {/* Matrix Grid - Worker Centric */}
                             <div className="p-10 rounded-[3.5rem] glass border-white/5 relative overflow-hidden">
                                 <div className="absolute top-0 left-0 w-64 h-64 bg-primary-500/5 blur-[100px] pointer-events-none"></div>
                                 <div className="flex items-center justify-between mb-10 relative z-10">
@@ -337,80 +414,155 @@ const Processing = () => {
                                         <div className="p-2 rounded-xl bg-slate-500/10 text-slate-400">
                                             <LayoutGroupIcon size={18} />
                                         </div>
-                                        <h3 className="text-2xl font-black tracking-tight text-white">Partition Compute Matrix</h3>
+                                        <h3 className="text-2xl font-black tracking-tight text-white uppercase">Distributed Workspace</h3>
                                     </div>
-                                    <div className="px-4 py-2 rounded-2xl bg-primary-500/5 border border-primary-500/10 flex items-center gap-3">
-                                        <div className="w-2 h-2 rounded-full bg-primary-500 animate-pulse"></div>
-                                        <span className="text-[10px] font-black text-primary-400 uppercase tracking-widest leading-none">Live Orchestration</span>
+                                    <div className="flex items-center gap-2">
+                                        <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest mr-2">Cluster Mirroring</span>
+                                        {Object.values(jobStatus?.node_states || {}).some(s => s === 'DEAD') ? (
+                                            <div className="px-4 py-2 rounded-2xl bg-rose-500/20 border border-rose-500/40 flex items-center gap-3 shadow-[0_0_20px_rgba(244,63,94,0.3)]">
+                                                <div className="w-2 h-2 rounded-full bg-rose-500 animate-ping"></div>
+                                                <span className="text-[10px] font-black text-rose-400 uppercase tracking-widest leading-none">Cluster Compromised</span>
+                                            </div>
+                                        ) : (
+                                            <div className="px-4 py-2 rounded-2xl bg-emerald-500/5 border border-emerald-500/10 flex items-center gap-3">
+                                                <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
+                                                <span className="text-[10px] font-black text-emerald-400 uppercase tracking-widest leading-none">Healthy Cluster</span>
+                                            </div>
+                                        )}
                                     </div>
                                 </div>
 
                                 <LayoutGroup>
-                                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-5 relative z-10">
-                                        <AnimatePresence mode="popLayout">
-                                            {jobStatus?.tasks.map((task) => (
-                                                <motion.div
-                                                    key={task.task_id}
-                                                    layout
-                                                    initial={{ opacity: 0, scale: 0.9, y: 20 }}
-                                                    animate={{ opacity: 1, scale: 1, y: 0 }}
-                                                    exit={{ opacity: 0, scale: 0.9 }}
-                                                    transition={{
-                                                        type: "spring",
-                                                        stiffness: 300,
-                                                        damping: 30
-                                                    }}
-                                                    className={`p-6 rounded-[2rem] border-2 transition-all duration-500 relative overflow-hidden group/task ${getStatusColor(task.status)} ${task.status === 'RUNNING' ? 'ring-1 ring-primary-500/30' : ''}`}
-                                                >
-                                                    {/* Animated glow for running tasks */}
-                                                    {task.status === 'RUNNING' && (
-                                                        <motion.div
-                                                            animate={{ opacity: [0.1, 0.3, 0.1] }}
-                                                            transition={{ duration: 2, repeat: Infinity }}
-                                                            className="absolute inset-0 bg-primary-500/10 pointer-events-none"
-                                                        />
-                                                    )}
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-10 relative z-10">
+                                        {/* Dynamic Worker Buckets */}
+                                        {(() => {
+                                            const workersMap = {}
+                                            const unassigned = []
 
-                                                    <div className="flex justify-between items-start mb-6">
-                                                        <div className="space-y-0.5">
-                                                            <span className="text-[8px] font-black uppercase tracking-[0.2em] opacity-40">Logical Unit</span>
-                                                            <h5 className="text-xl font-black font-mono tracking-tight text-white">#{(task.partition).toString().padStart(2, '0')}</h5>
-                                                        </div>
-                                                        <div className="text-right">
-                                                            <div className={`p-1.5 rounded-lg bg-white/5 border border-white/5 group-hover/task:border-white/10 transition-colors`}>
-                                                                <Cpu className="w-4 h-4 opacity-50" />
-                                                            </div>
-                                                        </div>
-                                                    </div>
+                                            // Primary source of truth for workers is node_states
+                                            const allWorkerIds = new Set(Object.keys(jobStatus?.node_states || {}));
 
-                                                    <div className="space-y-4">
-                                                        <div className="flex items-center justify-between px-1">
-                                                            <div className="flex items-center gap-2">
-                                                                <Server className="w-3.5 h-3.5 text-slate-500" />
-                                                                <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">{task.assigned_node ? task.assigned_node : 'PENDING'}</span>
-                                                            </div>
-                                                            <div className="flex items-center gap-1.5 text-[10px] font-mono font-bold text-slate-500">
-                                                                <Clock className="w-3 h-3" />
-                                                                {task.execution_time.toFixed(1)}s
-                                                            </div>
-                                                        </div>
+                                            jobStatus?.tasks?.forEach(task => {
+                                                if (task.assigned_node) {
+                                                    if (!workersMap[task.assigned_node]) workersMap[task.assigned_node] = []
+                                                    workersMap[task.assigned_node].push(task)
+                                                    allWorkerIds.add(task.assigned_node)
+                                                } else {
+                                                    unassigned.push(task)
+                                                }
+                                                // Also add failed nodes from history
+                                                task.history?.forEach(h => {
+                                                    const name = h.toString().replace('FAILED:', '');
+                                                    allWorkerIds.add(name)
+                                                })
+                                            })
 
-                                                        <div className="w-full h-2 bg-black/40 rounded-full overflow-hidden p-0.5 border border-white/5 shadow-inner">
+                                            // Sort worker IDs for stable layout
+                                            const sortedWorkerIds = Array.from(allWorkerIds).sort();
+
+                                            return (
+                                                <>
+                                                    {sortedWorkerIds.map((workerId) => {
+                                                        const tasks = workersMap[workerId] || [];
+                                                        // A worker is offline if it's dead OR if it's missing from the current node_states
+                                                        const isOffline = jobStatus?.node_states?.[workerId] === 'DEAD' || !jobStatus?.node_states?.[workerId];
+
+                                                        return (
                                                             <motion.div
-                                                                className={`h-full rounded-full ${getProgressBarColor(task.status)} group-hover/task:brightness-125 transition-all shadow-[0_0_10px_rgba(0,0,0,0.5)]`}
-                                                                animate={{ width: `${task.progress}%` }}
-                                                                transition={{ type: "spring", stiffness: 100 }}
-                                                            />
-                                                        </div>
-                                                    </div>
+                                                                key={workerId}
+                                                                layout
+                                                                initial={{ opacity: 0, scale: 0.95 }}
+                                                                animate={{
+                                                                    opacity: 1,
+                                                                    scale: 1,
+                                                                    borderColor: isOffline ? "rgba(244, 63, 94, 0.4)" : "rgba(255, 255, 255, 0.1)"
+                                                                }}
+                                                                className={`p-8 rounded-[3rem] ${isOffline ? 'bg-rose-500/[0.05]' : 'bg-white/[0.02]'} border relative group/worker shadow-2xl transition-all duration-1000`}
+                                                            >
+                                                                <div className="flex items-center justify-between mb-8 pb-4 border-b border-white/5">
+                                                                    <div className="flex items-center gap-4">
+                                                                        <div className={`w-12 h-12 rounded-2xl ${isOffline ? 'bg-rose-500/20' : 'bg-primary-500/10'} flex items-center justify-center border ${isOffline ? 'border-rose-500/40' : 'border-primary-500/20'} group-hover/worker:scale-110 transition-all`}>
+                                                                            <Server className={`w-6 h-6 ${isOffline ? 'text-rose-400' : 'text-primary-400'}`} />
+                                                                        </div>
+                                                                        <div>
+                                                                            <h4 className={`text-lg font-black ${isOffline ? 'text-rose-400' : 'text-white'} uppercase tracking-tighter`}>
+                                                                                {isOffline ? 'Critical Failure' : 'Compute Vessel'}
+                                                                            </h4>
+                                                                            <p className={`text-[9px] font-black ${isOffline ? 'text-rose-500/60' : 'text-primary-500/60'} uppercase tracking-widest truncate max-w-[150px]`}>{workerId}</p>
+                                                                        </div>
+                                                                    </div>
+                                                                    <div className="flex items-center gap-2">
+                                                                        {!isOffline && (
+                                                                            <button
+                                                                                onClick={() => handleSimulateFailure(workerId, 'kill')}
+                                                                                className="p-2 rounded-xl bg-rose-500/10 text-rose-500 hover:bg-rose-500/20 transition-all border border-rose-500/20 group/kill"
+                                                                                title="Simulate Hardware Failure"
+                                                                            >
+                                                                                <Zap size={14} className="group-hover/kill:scale-125 transition-transform" />
+                                                                            </button>
+                                                                        )}
+                                                                        {isOffline ? (
+                                                                            <div className="px-3 py-1 bg-rose-600/30 rounded-full text-[9px] font-black text-rose-300 uppercase tracking-widest border border-rose-500/50 animate-pulse">
+                                                                                Node Disconnected
+                                                                            </div>
+                                                                        ) : (
+                                                                            <div className="px-3 py-1 bg-primary-500/10 rounded-full text-[9px] font-black text-primary-400 uppercase tracking-widest">
+                                                                                {tasks.length} Partitions
+                                                                            </div>
+                                                                        )}
+                                                                    </div>
+                                                                </div>
 
-                                                    <div className="mt-4 flex items-center justify-between text-[8px] font-black uppercase tracking-[0.2em] opacity-30 pt-4 border-t border-white/5">
-                                                        <span>Status</span>
-                                                        <span>{task.status}</span>
-                                                    </div>
-                                                </motion.div>
-                                            ))}
-                                        </AnimatePresence>
+                                                                {isOffline && (
+                                                                    <div className="absolute inset-0 bg-rose-500/[0.08] backdrop-blur-[2px] z-10 flex flex-col items-center justify-center pointer-events-none rounded-[3rem]">
+                                                                        <div className="px-6 py-2 bg-rose-600/80 rounded-full border border-rose-400 shadow-[0_0_30px_rgba(225,29,72,0.4)] mb-4">
+                                                                            <span className="text-sm font-black text-white uppercase tracking-[0.3em] animate-pulse">OFFLINE</span>
+                                                                        </div>
+                                                                        <RefreshCw className="w-16 h-16 animate-spin-slow text-rose-500/40" />
+                                                                    </div>
+                                                                )}
+
+                                                                <div className="grid grid-cols-2 lg:grid-cols-3 gap-4 min-h-[100px]">
+                                                                    <AnimatePresence mode="popLayout">
+                                                                        {tasks.map(task => (
+                                                                            <TaskCard key={task.task_id} task={task} />
+                                                                        ))}
+                                                                    </AnimatePresence>
+                                                                </div>
+                                                            </motion.div>
+                                                        );
+                                                    })}
+
+                                                    {/* Unassigned / Master Queue */}
+                                                    {unassigned.length > 0 && (
+                                                        <motion.div
+                                                            layout
+                                                            className="p-8 rounded-[3rem] bg-black/40 border border-white/5 border-dashed relative"
+                                                        >
+                                                            <div className="flex items-center justify-between mb-8 pb-4 border-b border-white/5 opacity-50">
+                                                                <div className="flex items-center gap-4">
+                                                                    <div className="w-12 h-12 rounded-2xl bg-white/5 flex items-center justify-center">
+                                                                        <Layers className="w-6 h-6 text-white/20" />
+                                                                    </div>
+                                                                    <div>
+                                                                        <h4 className="text-lg font-black text-white/40 uppercase tracking-tighter">Master Queue</h4>
+                                                                        <p className="text-[9px] font-black text-white/20 uppercase tracking-widest">Awaiting Scheduling</p>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+
+                                                            <div className="grid grid-cols-3 lg:grid-cols-4 gap-4">
+                                                                <AnimatePresence mode="popLayout">
+                                                                    {unassigned.map(task => (
+                                                                        <TaskCard key={task.task_id} task={task} />
+                                                                    ))}
+                                                                </AnimatePresence>
+                                                            </div>
+                                                        </motion.div>
+                                                    )}
+                                                </>
+                                            )
+                                        })()}
                                     </div>
                                 </LayoutGroup>
                             </div>
@@ -454,6 +606,94 @@ const Processing = () => {
         </motion.div>
     )
 }
+
+// Extracted TaskCard for cleaner code and specialized animation
+const TaskCard = ({ task }) => {
+    const isMigrated = task.history && task.history.length > 1;
+
+    // Determine status color helpers
+    const getStatusColor = (status) => {
+        if (status === 'QUEUED' && isMigrated) return 'text-amber-400 bg-amber-500/10 border-amber-500/20 shadow-[0_0_20px_rgba(245,158,11,0.1)]'
+        switch (status) {
+            case 'QUEUED': return 'text-slate-500 bg-slate-500/10 border-slate-500/20'
+            case 'RUNNING': return 'text-primary-400 bg-primary-500/10 border-primary-500/20'
+            case 'COMPLETED': return 'text-emerald-400 bg-emerald-500/10 border-emerald-400/20'
+            case 'FAILED': return 'text-rose-400 bg-rose-500/10 border-rose-500/20'
+            default: return 'text-slate-500 bg-white/5 border-white/10'
+        }
+    }
+
+    const getProgressBarColor = (status) => {
+        if (status === 'QUEUED' && isMigrated) return 'bg-amber-500 animate-pulse'
+        switch (status) {
+            case 'RUNNING': return 'bg-primary-500'
+            case 'COMPLETED': return 'bg-emerald-500'
+            case 'FAILED': return 'bg-rose-500'
+            default: return 'bg-slate-700'
+        }
+    }
+
+    return (
+        <motion.div
+            layout
+            layoutId={task.task_id}
+            initial={{ opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.9 }}
+            transition={{
+                layout: { duration: 0.6, type: "spring", stiffness: 300, damping: 30 },
+                opacity: { duration: 0.2 }
+            }}
+            className={`p-4 rounded-2xl border transition-all duration-300 relative overflow-hidden group/task ${getStatusColor(task.status)} font-bold`}
+        >
+            {isMigrated && (
+                <div className={`absolute top-0 right-0 px-2 py-0.5 ${task.status === 'QUEUED' ? 'bg-amber-500' : 'bg-rose-500'} text-[6px] font-black text-white uppercase tracking-widest rounded-bl-lg z-20 animate-pulse`}>
+                    {task.status === 'QUEUED' ? 'Migrating' : 'Migrated'}
+                </div>
+            )}
+
+            <div className="flex justify-between items-start mb-3">
+                <div className="space-y-0.5">
+                    <span className="text-[7px] font-black uppercase tracking-widest opacity-40">Unit</span>
+                    <h5 className="text-sm font-black font-mono text-white">#{(task.partition).toString().padStart(2, '0')}</h5>
+                </div>
+                <div className="p-1 rounded-md bg-white/5">
+                    <Database className="w-3 h-3 text-purple-400 opacity-40" />
+                </div>
+            </div>
+
+            <div className="mb-4">
+                <div className="text-[7px] font-mono text-slate-400 truncate bg-black/40 px-2 py-1 rounded-md border border-white/5">
+                    {task.data_snippet}
+                </div>
+            </div>
+
+            <div className="space-y-3">
+                <div className="flex justify-between items-center text-[7px] font-black uppercase tracking-tighter text-slate-500 mb-1">
+                    <span>Progress</span>
+                    <span>{task.progress}%</span>
+                </div>
+                <div className="w-full h-1 bg-black/40 rounded-full overflow-hidden border border-white/5">
+                    <motion.div
+                        className={`h-full rounded-full ${getProgressBarColor(task.status)} shadow-[0_0_10px_rgba(0,0,0,0.5)]`}
+                        animate={{ width: `${task.progress}%` }}
+                        transition={{ duration: 0.5 }}
+                    />
+                </div>
+
+                {isMigrated && (
+                    <div className="flex items-center gap-1 opacity-60">
+                        <RefreshCw className={`w-2 h-2 ${task.status === 'QUEUED' ? 'text-amber-400 animate-spin' : 'text-rose-400'}`} />
+                        <span className={`text-[6px] font-black uppercase ${task.status === 'QUEUED' ? 'text-amber-300' : 'text-rose-300'}`}>
+                            {task.status === 'QUEUED' ? 'Rerouting Payload...' : 'Resumed from Failure'}
+                        </span>
+                    </div>
+                )}
+            </div>
+        </motion.div>
+    )
+}
+
 
 const LayoutGroupIcon = ({ size }) => (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">

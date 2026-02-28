@@ -8,28 +8,37 @@ from flask_cors import CORS
 import os
 import sys
 
-# --- Real Spark Integration (WSL Ubuntu) ---
-# findspark MUST be initialized BEFORE importing SparkSession
+# --- Windows Environment Fixes ---
+# Force current python from venv/absolute path
+os.environ['PYSPARK_PYTHON'] = sys.executable
+os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
+os.environ['PYSPARK_PIN_THREAD'] = 'false'
+
+print(f"DEBUG: sys.executable = {sys.executable}")
+print(f"DEBUG: PYSPARK_PYTHON = {os.environ.get('PYSPARK_PYTHON')}")
+
+# --- Spark Integration ---
+# findspark is optional if pyspark is in site-packages
 try:
     import findspark
-    # Try common Spark locations in WSL
-    possible_spark_homes = [
-        os.path.expanduser("~/spark"),
-        "/usr/local/spark",
-        "/opt/spark"
-    ]
-    spark_home = None
-    for path in possible_spark_homes:
-        if os.path.exists(path):
-            spark_home = path
-            break
-            
+    spark_home = os.environ.get("SPARK_HOME")
+    
+    # Only try WSL paths if NOT on Windows or if specifically requested
+    if not spark_home and os.name != 'nt':
+        possible_spark_homes = ["/usr/local/spark", "/opt/spark"]
+        for path in possible_spark_homes:
+            if os.path.exists(path):
+                spark_home = path
+                break
+    
     if spark_home:
         print(f"Init: findspark.init('{spark_home}')")
         findspark.init(spark_home)
     else:
-        print("Init: findspark.init() - searching in PATH")
+        print("Init: findspark.init() - searching in PATH or using pip-installed pyspark")
         findspark.init()
+except Exception as e:
+    print(f"Note: findspark initialization skipped or failed: {e}")
 except ImportError:
     print("Warning: findspark not installed. PySpark may fail on Windows/WSL.")
 
@@ -43,17 +52,50 @@ CORS(app)
 
 # --- Spark Initialization (Fail-Safe Mode) ---
 # We default to local mode so the backend ALWAYS starts, even if your cluster is off.
+# --- Spark Initialization (REAL DISTRIBUTED CLUSTER MODE) ---
 try:
-    print("Initializing Spark in LOCAL MODE (Guaranteed to start)...")
-    spark = SparkSession.builder \
-        .appName("ClusterFlow-Engine") \
-        .master("local[*]") \
-        .config("spark.driver.bindAddress", "127.0.0.1") \
+    MASTER_IP = "10.175.64.64"   # Your Windows laptop IP
+    DRIVER_PORT = "5050"
+
+    print(f"Initializing Spark CLUSTER MODE → spark://{MASTER_IP}:7077")
+
+    spark = (
+        SparkSession.builder
+        .appName("ClusterFlow")
+        .master(f"spark://{MASTER_IP}:7077")
+
+        # ★★★ CRITICAL NETWORK FIX ★★★
+        # workers connect to this address
+        .config("spark.driver.host", MASTER_IP)
+
+        # driver binds to all interfaces inside WSL
+        .config("spark.driver.bindAddress", "0.0.0.0")
+
+        # fixed port so firewall can allow
+        .config("spark.driver.port", DRIVER_PORT)
+
+        # prevents executor timeout while connecting
+        .config("spark.network.timeout", "300s")
+        .config("spark.executor.heartbeatInterval", "60s")
+
+        # stability configs
+        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+        .config("spark.python.worker.reuse", "true")
+
+        .config("spark.executor.memory", "1g")
+        .config("spark.executor.cores", "1")
+
         .getOrCreate()
+    )
+
     sc = spark.sparkContext
-    print("✅ Spark is ONLINE (Local Mode).")
+
+    print("✅ Spark Driver successfully connected to distributed cluster!")
+    print(f"Driver reachable at: {MASTER_IP}:{DRIVER_PORT}")
+
 except Exception as e:
-    print(f"❌ CRITICAL ERROR: Could not even start Local Spark: {e}")
+    print("❌ Spark cluster connection failed")
+    print(e)
     sc = None
 
 # Note: To use your REAL cluster, you'd change .master("local[*]") 
@@ -76,6 +118,8 @@ class Task:
         self.start_time = None
         self.end_time = None
         self.result = None
+        self.history = []  # Track nodes this task was assigned to
+        self.data_snippet = str(data[:3]) + "..." if isinstance(data, list) and len(data) > 3 else str(data)
 
 class Job:
     def __init__(self, job_id, job_type, num_partitions, data):
@@ -110,6 +154,8 @@ class WorkerNode:
         self.current_task = task
         task.status = "RUNNING"
         task.assigned_node = self.node_id
+        if self.node_id not in task.history:
+            task.history.append(self.node_id)
         task.start_time = time.time()
         
         self._stop_event.clear()
@@ -183,8 +229,11 @@ class WorkerNode:
 
 
 class DistributedEngine:
-    def __init__(self, num_nodes=6):
-        self.nodes = {f"worker-{i+1}": WorkerNode(f"worker-{i+1}") for i in range(num_nodes)}
+    def __init__(self, num_nodes=0):
+        # Start with 0 workers, we will sync with real Spark cluster
+        self.nodes = {} 
+        self.worker_id_map = {} # Maps real Spark ID to worker-1, worker-2...
+        self.worker_counter = 0
         self.jobs = {}
         self.task_queue = []
         self.audit_logs = []
@@ -195,6 +244,63 @@ class DistributedEngine:
         self.scheduler_thread = threading.Thread(target=self._scheduler_loop)
         self.scheduler_thread.daemon = True
         self.scheduler_thread.start()
+        
+        # Cluster Synchronization thread
+        self.sync_thread = threading.Thread(target=self._sync_with_spark_master)
+        self.sync_thread.daemon = True
+        self.sync_thread.start()
+
+    def _get_worker_alias(self, real_id):
+        if real_id not in self.worker_id_map:
+            self.worker_counter += 1
+            self.worker_id_map[real_id] = f"worker-{self.worker_counter}"
+        return self.worker_id_map[real_id]
+
+    def _sync_with_spark_master(self):
+        import urllib.request, json
+        print("DEBUG: Cluster Sync Thread Started (Polling 10.175.64.64:8080/json)")
+        while self.running:
+            try:
+                # Poll Spark Master JSON API
+                with urllib.request.urlopen("http://10.175.64.64:8080/json", timeout=2) as url:
+                    data = json.loads(url.read().decode())
+                    # Get ALIVE workers
+                    real_workers = [w for w in data.get("workers", []) if w.get("state") == "ALIVE"]
+                    
+                    # Create consistent IDs for the UI
+                    # Using full Spark Worker ID (e.g., worker-YYYYMMDDHHMMSS-IP-PORT)
+                    real_ids = {}
+                    for w in real_workers:
+                        w_id = w.get("id")
+                        real_ids[w_id] = w
+                    
+                    # Add new workers to simulation
+                    for worker_id, w_info in real_ids.items():
+                        # Get a clean alias: worker-1, worker-2...
+                        alias = self._get_worker_alias(worker_id)
+                        
+                        if alias not in self.nodes:
+                            # Use the alias as the key for consistency in UI
+                            addr = w_info.get("address", "worker").split("://")[-1]
+                            self.nodes[alias] = WorkerNode(alias) # Use alias as ID
+                            self._log_event("NODE_JOINED", f"Real Worker {alias} (@{addr}) joined cluster.", "SPARK_MASTER")
+                            print(f"DEBUG: Synchronized new worker: {alias} (Spark ID: {worker_id})")
+                            
+                    # Remove or kill lost workers
+                    # We check if any of our active aliases no longer correspond to a live Spark Worker ID
+                    active_aliases = [self._get_worker_alias(wid) for wid in real_ids.keys()]
+                    for alias in list(self.nodes.keys()):
+                        if alias not in active_aliases:
+                            if self.nodes[alias].state != "DEAD":
+                                self.nodes[alias].kill()
+                                self._log_event("NODE_LOST", f"Real Worker {alias} left cluster.", "SPARK_MASTER")
+                                print(f"DEBUG: Worker lost: {alias}")
+            except Exception as e:
+                # Master offline or network issue
+                if len(self.nodes) > 0 and not any(n.state == "DEAD" for n in self.nodes.values()):
+                    print(f"DEBUG: Sync Error (Master Offline?): {e}")
+            
+            time.sleep(3)
 
     def _log_event(self, event_type, message, source="MASTER"):
         event = {
@@ -250,6 +356,11 @@ class DistributedEngine:
         # Re-queue failed task
         print(f"Task {task.task_id} failed on {task.assigned_node}. Re-queueing...")
         self._log_event("TASK_FAILED", f"Task {task.task_id} failed on {task.assigned_node}. Re-queueing.", "SCHEDULER")
+        
+        # Mark current node as failed in history if not already there
+        if task.assigned_node and f"FAILED:{task.assigned_node}" not in task.history:
+            task.history.append(f"FAILED:{task.assigned_node}")
+            
         task.status = "QUEUED"
         task.assigned_node = None
         task.progress = 0
@@ -274,7 +385,7 @@ class DistributedEngine:
                 self._log_event("TASK_ASSIGNED", f"Task {task.task_id} assigned to {node.node_id}.", "SCHEDULER")
 
 
-engine = DistributedEngine(num_nodes=6)
+engine = DistributedEngine(num_nodes=0)
 
 # REST API
 
@@ -313,18 +424,40 @@ def submit_job():
         
     job_id = engine.submit_job(job_type, num_partitions, data)
     
-    # Trigger real distributed computation on the actual Spark cluster
-    # This runs asynchronously with the simulation since UI just visualizes
-    real_result = None
+    # Trigger real distributed computation on the actual Spark cluster in a BACKGROUND THREAD
     if sc:
-        real_result = run_real_spark_job(data, num_partitions)
+        def background_job():
+            try:
+                print(f"DEBUG: Starting real Spark job for {job_id}")
+                result = run_real_spark_job(data, num_partitions)
+                if job_id in engine.jobs:
+                    engine.jobs[job_id].real_result = result
+                print(f"DEBUG: Real Spark job for {job_id} finished")
+            except Exception as e:
+                print(f"DEBUG: Real Spark job for {job_id} failed: {e}")
+                if job_id in engine.jobs:
+                    engine.jobs[job_id].real_result = f"Error: {e}"
+                    
+        threading.Thread(target=background_job, daemon=True).start()
     else:
-        real_result = "Real Spark Context (sc) Offline"
-        
-    if job_id in engine.jobs:
-        engine.jobs[job_id].real_result = real_result
+        if job_id in engine.jobs:
+            engine.jobs[job_id].real_result = "Real Spark Context (sc) Offline"
         
     return jsonify({"status": "submitted", "job_id": job_id})
+
+@app.route("/active_job", methods=["GET"])
+def active_job():
+    # Find the most recent running or just submitted job
+    running_jobs = [j_id for j_id, j in engine.jobs.items() if j.status == "RUNNING"]
+    if running_jobs:
+        return jsonify({"job_id": running_jobs[-1]})
+    
+    # If no running, return the last completed one if it's recent (optional, but let's keep it simple)
+    if engine.jobs:
+        last_id = list(engine.jobs.keys())[-1]
+        return jsonify({"job_id": last_id})
+        
+    return jsonify({"job_id": None})
 
 @app.route("/cluster_status", methods=["GET"])
 def cluster_status():
@@ -375,9 +508,14 @@ def job_status(job_id):
             "status": t.status,
             "assigned_node": t.assigned_node,
             "progress": t.progress,
-            "execution_time": round((t.end_time or time.time()) - t.start_time, 2) if t.start_time else 0
+            "execution_time": round((t.end_time or time.time()) - t.start_time, 2) if t.start_time else 0,
+            "history": t.history,
+            "data_snippet": t.data_snippet
         })
         
+    # Add node health information for the UI
+    node_states = {n_id: n.state for n_id, n in engine.nodes.items()}
+    
     return jsonify({
         "job_id": job.job_id,
         "job_type": job.job_type,
@@ -385,6 +523,7 @@ def job_status(job_id):
         "execution_time": round((job.end_time or time.time()) - job.start_time, 2),
         "total_partitions": len(job.tasks),
         "tasks": tasks_info,
+        "node_states": node_states,
         "real_spark_result": job.real_result
     })
 
